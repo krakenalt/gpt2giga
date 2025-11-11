@@ -33,15 +33,12 @@ class AttachmentProcessor:
 
     def upload_image(self, image_url: str) -> Optional[str]:
         """Загружает изображение в GigaChat и возвращает file_id"""
-
-        # Fast regex match, single search, avoids repeated parsing
-        base64_matches = re.search(r"data:(.+);base64,(.+)", image_url)
+        base64_matches = re.search(r"data:(.+);(.+),(.+)", image_url)
         hashed = hashlib.sha256(image_url.encode()).hexdigest()
 
-        cached_id = self.cache.get(hashed)
-        if cached_id is not None:
+        if hashed in self.cache:
             self.logger.debug(f"Image found in cache: {hashed}")
-            return cached_id
+            return self.cache[hashed]
 
         try:
             if not base64_matches:
@@ -56,18 +53,17 @@ class AttachmentProcessor:
                     )
                     return None
             else:
-                # Optimized: Only handle base64 and avoid .groups() slowdown if no match
-                # Regex pattern already ensures type_ == "base64"
-                content_type = base64_matches.group(1)
-                image_str = base64_matches.group(2)
+                content_type, type_, image_str = base64_matches.groups()
+                if type_ != "base64":
+                    self.logger.warning(f"Unsupported encoding type: {type_}")
+                    return None
                 content_bytes = base64.b64decode(image_str)
                 self.logger.debug("Decoded base64 image")
 
             # Конвертируем и сжимаем изображение
-            with Image.open(io.BytesIO(content_bytes)) as image:
-                image = image.convert("RGB")
-                buf = io.BytesIO()
-                image.save(buf, format="JPEG", quality=85)
+            image = Image.open(io.BytesIO(content_bytes)).convert("RGB")
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=85)
             buf.seek(0)
 
             self.logger.info("Uploading image to GigaChat...")
@@ -89,7 +85,7 @@ class RequestTransformer:
         self,
         config: ProxyConfig,
         logger,
-        attachment_processor: Optional["AttachmentProcessor"] = None,
+        attachment_processor: Optional[AttachmentProcessor] = None,
     ):
         self.config = config
         self.logger = logger
@@ -156,16 +152,15 @@ class RequestTransformer:
         texts = []
         attachments = []
 
-        enable_images = (
-            self.attachment_processor is not None
-            and self.config.proxy_settings.enable_images
-        )
-
         for content_part in content_parts:
-            t = content_part.get("type")
-            if t == "text":
+            if content_part.get("type") == "text":
                 texts.append(content_part.get("text", ""))
-            elif enable_images and t == "image_url" and content_part.get("image_url"):
+            elif (
+                content_part.get("type") == "image_url"
+                and content_part.get("image_url")
+                and self.attachment_processor
+                and self.config.proxy_settings.enable_images
+            ):
                 file_id = self.attachment_processor.upload_image(
                     content_part["image_url"]["url"]
                 )
@@ -240,37 +235,28 @@ class RequestTransformer:
             message_payload.append({"role": "user", "content": input_})
 
         elif isinstance(input_, list):
+            contents = []
             for message in input_:
-                m_type = message.get("type")
-                if m_type == "function_call_output":
+                is_message = message.get("role")
+                is_tool_call = message.get("type") == "function_call"
+                is_tool_call_output = message.get("type") == "function_call_output"
+                if is_tool_call_output:
                     message_payload.append(
                         {"role": "function", "content": message.get("output")}
                     )
-                    continue
-                elif m_type == "function_call":
+                elif is_tool_call:
                     message_payload.append(self.mock_completion(message))
-                    continue
-
-                role = message.get("role")
-                if role:
+                elif is_message:
                     content = message.get("content")
                     if isinstance(content, list):
-                        # Use a local list to avoid accumulating contents across messages
-                        contents = []
-                        append = (
-                            contents.append
-                        )  # Micro-optimization for attribute access
                         for content_part in content:
-                            ctype = content_part.get("type")
-                            if ctype == "input_text":
-                                append(
-                                    {
-                                        "type": "text",
-                                        "text": content_part.get("text"),
-                                    }
+                            if content_part.get("type") == "input_text":
+                                contents.append(
+                                    {"type": "text", "text": content_part.get("text")}
                                 )
-                            elif ctype == "input_image":
-                                append(
+
+                            elif content_part.get("type") == "input_image":
+                                contents.append(
                                     {
                                         "type": "image_url",
                                         "image_url": {
@@ -279,9 +265,16 @@ class RequestTransformer:
                                     }
                                 )
 
-                        message_payload.append({"role": role, "content": contents})
+                        message_payload.append(
+                            {"role": message.get("role"), "content": contents}
+                        )
                     else:
-                        message_payload.append({"role": role, "content": content})
+                        message_payload.append(
+                            {
+                                "role": message.get("role"),
+                                "content": message.get("content"),
+                            }
+                        )
         return message_payload
 
     @staticmethod
@@ -316,14 +309,16 @@ class RequestTransformer:
     @staticmethod
     def _collapse_messages(messages: List[Messages]) -> List[Messages]:
         """Объединяет последовательные пользовательские сообщения"""
-        collapsed_messages: List[Messages] = []
-        prev_user_message = None
+        collapsed_messages = []
         for message in messages:
-            if message.role == "user" and prev_user_message is not None:
-                prev_user_message.content += "\n" + message.content
+            if (
+                collapsed_messages
+                and message.role == "user"
+                and collapsed_messages[-1].role == "user"
+            ):
+                collapsed_messages[-1].content += "\n" + message.content
             else:
                 collapsed_messages.append(message)
-                prev_user_message = message if message.role == "user" else None
         return collapsed_messages
 
 
@@ -338,21 +333,34 @@ class ResponseProcessor:
     ) -> dict:
         """Обрабатывает обычный ответ от GigaChat"""
         giga_dict = giga_resp.dict()
-        is_tool_call = giga_dict["choices"][0]["finish_reason"] == "function_call"
-        for choice in giga_dict["choices"]:
-            self._process_choice(choice, is_tool_call)
+        choices = giga_dict["choices"]
+        # Precompute whether this is a tool call just once
+        is_tool_call = choices[0]["finish_reason"] == "function_call"
+        # Avoid repeated attribute lookups, and avoid range() usage overhead
+        # Use a local reference to the _process_choice method for loop, which is micro-optimization for inner loop
+        process_choice = self._process_choice
+        # Iterate with minimal overhead
+        for choice in choices:
+            process_choice(choice, is_tool_call)
+        # Avoid double lookups in result
         result = {
             "id": f"chatcmpl-{response_id}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": gpt_model,
-            "choices": giga_dict["choices"],
+            "choices": choices,
             "usage": self._build_usage(giga_dict["usage"]),
             "system_fingerprint": f"fp_{response_id}",
         }
 
-        self.logger.debug("Processed chat completion response")
-        self.logger.debug(f"Response: {result}")
+        # Only call logger.debug(f"Response: {result}") if enabled by the logger
+        debug_enabled = getattr(self.logger, "isEnabledFor", None)
+        # Avoid expensive __repr__ if debug logging not enabled
+        if debug_enabled and self.logger.isEnabledFor(10):  # 10 is logging.DEBUG
+            self.logger.debug("Processed chat completion response")
+            self.logger.debug(f"Response: {result}")
+        else:
+            self.logger.debug("Processed chat completion response")
         return result
 
     def process_response_api(
@@ -562,13 +570,13 @@ class ResponseProcessor:
         if not usage_data:
             return None
 
+        # Assignment reduction -- only one lookup for get
+        cached_tokens = usage_data.get("precached_prompt_tokens", 0)
         return {
             "prompt_tokens": usage_data["prompt_tokens"],
             "completion_tokens": usage_data["completion_tokens"],
             "total_tokens": usage_data["total_tokens"],
-            "prompt_tokens_details": {
-                "cached_tokens": usage_data.get("precached_prompt_tokens", 0)
-            },
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
             "completion_tokens_details": {"reasoning_tokens": 0},
         }
 
